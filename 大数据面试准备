@@ -1,0 +1,295 @@
+---
+title:大数据面试准备2.0
+
+---
+
+# 一.Hive
+
+## 1.MySQL和Hive SQL的执行顺序
+
+```mysql
+# Mysql
+from...where...group by...having...select...order by...limit
+
+# HiveSQL
+from...where...select...group by...having...order by...limit
+```
+
+## 2. 数据倾斜的处理办法
+
+* Join无关的优化
+
+  * **group by引起的数据倾斜优化**: group by后使用聚合函数如sum()、count()，max()，min()等
+
+    * **SQL优化**：很麻烦。
+
+      ```mysql
+      #优化前
+      select key_col, sum(cnt) as cnt
+      from tb_name 
+      group by key_col
+      
+      #优化后
+      select case
+      			when key_col like "%hello" then split(key_col,'-')[1] 
+      			else key_col
+      	   end as key_col, sum(cnt) as cnt
+      from (
+          select key_col, sum(cnt) as cnt
+          from (
+              select case
+                          when key_col="hello" then caoncat_ws("-", rand(), key_col) 
+                          else key_col
+                     end as key_col, cnt
+              from tb_name
+          ) a
+          group by key_col
+      ) res
+      group by case when key_col like "%hello" then split(key_col,'-')[1] else key_col end
+      ```
+
+    * **设置Hive参数**：Hive在数据倾斜的时候会进行负载均衡，生成的查询计划会有两个MapReduce Job。
+
+      ```mysql
+      set hive.map.aggr = true
+      set hive.groupby.skewindata = true
+      ```
+
+      ==第一个MapReduce Job==中，**Map的输出结果集合会随机分布到Reduce中，每个Reduce做部分聚合操作并输出结果**，这样处理的结果是相同的GroupBy Key有可能被分布到不同的Reduce中，从而达到负载均衡的目的。
+
+      ==第二个MapReduce Job==再根据**预处理的数据结果按照GroupBy Key分布到用一个Reduce中**，最后完成最终的聚合操作。
+
+  * **count distinct优化**：
+
+    ```mysql
+    select count(distinct user) 
+    from some_table;
+    ```
+
+    由于必须去重，因此Hive将**会把Map阶段的输出全部分布到一个Reduce Task上**，此时很容易引起性能问题。
+
+    **可以通过先group by在count的方式来优化**
+
+    ```mysql
+    select count(user)
+    from (
+        select user
+        from some_table
+        group by user
+    ) t
+    ```
+
+* **Join相关的优化**：join时，关联字段为空字符串，则视为正常数据；关联字段为null，则改行数据放弃，不会和其他表进行关联。
+
+  * **mapjoin可以解决的join优化（即大表join小表）**
+
+    * **在select中添加mapjoin hint注释**
+
+      ```mysql
+      select /*+mapjoin(small_table)*/ a,b,c
+      from small_table left join big_table
+      on small_table.x = big_table.x
+      ```
+
+    * 开启mapjoin参数，默认开启。
+
+      ```mysql
+      #开启mapjoin
+      set hive.auto.convert.join = true
+      #设置小表的阈值大小
+      set hive.mapjoin.smlltable.filesize
+      ```
+
+      ==老版本的Hive在join时，会要求将小表放在join的左边来触发mapjoin，新版本在左和在右已经没有区别。==
+
+      ==执行join操作，Hive会自动对参与join的key做空值过滤。但非innerjoin的其他join操作不会做过滤。==
+
+  * **mpjoin无法解决的join优化（即大表join大表）**
+
+    有时join超时是因为某些key对应的数据太多，而相同key对应的数据都会发送到相同的reducer上，从而导致内存不够。
+
+    * **空key过滤**
+
+      此时应该仔细分析这些异常的key，很多情况下，这些key对应的数据是异常数据，需要在SQL语句中进行过滤。如果key对应的字段为空，且是异常数据，应该在join前直接过滤掉。
+
+      ```mysql
+      # 不过滤空key
+      select t1.* from t1 left join t2 on t1.id = t2.id;
+      
+      #过滤空key
+      select t1.*
+      from (
+          select *
+          from t1
+          where id is not null
+      ) t2
+      left join t2 on t1.id = t2.id;
+      ```
+
+    * **空key转换**
+
+      有时虽然某个key为空对应的数据很多，但是相应的数据不是异常数据，必须要包含在join的结果中，可以再key为空的字段附一个随机值，使得数据随机均匀分布到不同的reduce中。
+
+## 3. Hive当中的lateral view 与explode以及reflect
+
+* 使用explode函数将hive表中的Map和Array字段数据进行拆分
+
+  * lateral view用于和split、explode等UDTF一起使用，能将一行数据拆分成多行数据，在此基础上可以对拆分的数据进行聚合，lateral view首先为原始表的每行调用UDTF， UDTF会把一行拆分成一行或者多行，lateral view再把结果组合，产生一个支持别名表的虚拟表。
+
+  * 其中explode还可以用于将hive一列中复杂的array或者map结构拆分成多行。
+
+  * explode函数只支持一个字段。UDTF函数`(如：explode)`只能只允许对拆分字段进行访问，即select时只能出现explode作用的字段，不能在选择表中其它的字段，否则会报错。
+
+  * Lateral View 通常和UDTF 一起出现，为了解决UDTF 不允许在select 字段的问题。Multiple Lateral View 可以实现类似笛卡尔乘积。Outer 关键字可以把不输出的UDTF 的空结果，输出成NULL，防止丢失数据。
+
+  * ```mysql
+    select goods_id2, sale_info 
+    from explode_lateral_view 
+    LATERAL VIEW explode(split(goods_id,',')) goods as goods_id2;
+    
+    #其中LATERAL VIEW explode(split(goods_id,','))goods 相当于一个虚拟表，与原表explode_lateral_view 笛卡尔积关联
+    ```
+
+# 二. Hbase
+
+## 1. 简述Hbase的读写流程
+
+* **写流程**：
+  * 客户端访问zookeeper，获取元数据表hbase:meta在哪个region server中。
+  * 访问对应的region server，获取到元数据表，根据写的请求，确定数据应该写到哪个region server的哪个region中，然后**将region信息和元数据表的信息缓存在客户端的meta cache中**，以便下次访问。
+  * 与对应的region server通讯。
+  * **将数据先写入到WAL文件中，然后再写入memstore中，数据会在memstore中进行排序**。
+  * 写入完成后，region server会向客户端发送ack。
+  * **等到达memstore的刷写时机（达到一个默认值大小或者达到刷写时间），将数据刷写到HFile中**。
+* **读流程**：
+  * 客户端先访问zookeeper，获取元数据表hbase:meta在哪个region server中。
+  * 访问对应的region server，获取到元数据表，根据读的请求，确定数据位于哪个region server的哪个region中，然后将region信息和元数据表的信息缓存在客户端的meta cache中，以便下次访问。
+  * 与对应的region server进行通讯。
+  * **先在block cache（读缓存）中读，如果没有，然后去memstore和hfile中读取，将读到的数据返回给客户端并且写入block cache中，方便下一次读取**。
+
+## 2.Hbase在写过程中region的split时机
+
+==每一个gion由一个或多个store组成，一个store由一个memstore和0或多个StoreFile组成。==
+
+* 默认情况下，每个table只有一个region，随着数据的不断写入，region会自动进行拆分。
+* region切分时机
+  * hbase0.94版本之前，当一个region中的某个store下的所有storefile总大小超过10G时，就会自动拆分，这个10G是默认值，可以更改配置参数。
+  * hbase0.94版本之后，当一个region中的某个store下的所有storefile总大小超过min(表的个数的平方*128M， 10G)的时候。
+
+## 3.HBase中compact用途是什么，什么时候触发，分为哪两种，有什么区别
+
+* **用途**
+  * 合并HFile文件，提高读写数据的效率。
+  * 清除过期和删除的数据。
+* **触发时间**
+  * 由于memstore每次刷写都会生成一个新的HFile，当HFile的数量达到一定程度后，就需要进行StoreFile Compaction。
+* **分类以及区别**
+  * **minor compaction**：
+    * 会将**临近的若干个较小的HFile合并成一个较大的HFile**。
+    * 不会清理过期和删除的数据。
+  * **major compaction**：
+    * 会将一个**Store下的所有HFile合并成一个大HFile**。
+    * 会清理掉过去和删除的数据。
+
+## 4. 热点现象怎么产生的，以及解决方法有哪些
+
+* 热点现象：
+  * 某段时间内，对HBase的读写请求集中到极少数的Region上，导致这些region所在的Region server处理请求量骤增，负载量明显偏大，而其他的RegionServer明显空闲。
+* 原因：
+  * HBase中的数据是按照字典排序的，大量连续的rowkey集中写在个别的region，各个region之间数据分布不均衡。
+  * 创建表时没有提前预分区，创建的表默认只有一个region，大量的数据写入当前region。
+  * 创建表已经提前预分区，但是设计的rowkey不合理。
+* 解决办法：
+  * 总的来说就是**预分区+rowkey设计**。
+  * **预分区**：就是在创建表的时候，提前划分出多个region而不是默认的一个。
+  * **rowkey设计**：就是通过设计出合理的rowkey，让数据均匀分布到所有的region中。
+
+## 5.HBase的rowkey设计原则
+
+* 长度原则：一般是100位以内。
+* 散列原则：rowkey要具有散列性。
+  * 计算hash值。
+  * 字符串反转。
+  * 字符串拼接。
+* 唯一原则：一个rowkey只能出现一次。
+
+# 三. Java基础
+
+## 1. 基本数据类型和引用数据类型的区别
+
+* **存储位置不同**：对于在方法中声明的变量，如果是基本数据类型，那么变量名和值都是存放在栈中，如果是引用数据类型，变量名存放在栈中，而只想的对象是存放在堆中。
+* **传递方式不同**：调用方法时，如果传递的参数是基本数据类型，那么就是按数值传递，如果传递的参数是引用数据类型，那么就是按引用传递，但是也不是说引用数据类型是引用传递，在java中只有值传递。
+
+## 2.java中方法的参数传递机制
+
+* 参数传递机制包括两种：**值传递**和**引用传递**
+  * **值传递**是指在调用函数时传递的是实际参数的值，那么在函数中对它进行修改，不会影响到实际参数。
+  * **引用传递**是指在调用函数时传递的是时机参数的地址，那么在函数中对它进行修改，会影响到实际参数。
+* 但是在java中只有值传递参数
+  * 为什么这样说呢？都知道数据类型分为两大类，基本数据类型和引用数据类型	
+    * **如果参数是基本数据类型**，那么传递过来的就是这个参数的一个副本，如果在函数中改变了副本的值明显不会改变原始的值。
+    * **如果参数是引用数据类型**，那么传过来的就是这个引用参数的一个副本，这个副本存放的是参数的地址。在函数中仅仅是改变了地址中的值，那么原始的值会改变，但是地址仍然没有改变。
+
+## 3. java的深拷贝和浅拷贝的区别
+
+* 对于基本类型，深拷贝和浅拷贝都是一样的，都是对原始数据的复制，修改原始数据不会对复制数据产生影响。
+
+* 对于引用类型
+
+  * 浅拷贝：只会复制引用，没有复制指向的对象，所以对象的修改，会对复制对象产生影响。
+  * 深拷贝：复制该引用指向的对象，所有修改原始对象，不会对复制对象产生影响。
+
+* 实现方式：继承Cloneable接口，重写clone方法，因为Object中的clone方法就是浅拷贝，所以对于浅拷贝实现就是在clone方法中直接调用super.clone()就可以了；对于深拷贝，一般需要调用强制类型转换操作。
+
+* ```java
+  // 浅拷贝
+  Teacher teacher = new Teacher("riemann", 28);
+  Teacher otherTeacher = teacher;
+  
+  //深拷贝
+  Teacher teacher = new Teacher("riemann", 28);
+  Teacher otherTeacher = (Teacher) teacher.clone();
+  ```
+
+## 4. java中的==和equals的区别
+
+* 对于基本数据类型，==比较的是对应的值，对于引用数据类型，\==比较的是地址值。
+* equals方法如果未被重写，其作用和==一致，但是通常会重写该方法，比如String类型，equals方法可以用来比较变量值。
+* 为什么重写equals方法要重写hashcode方法
+  * 因为hashcode中有一个规定：如果两个对象相等，那么他们的hashcode值一定相等，如果值重写了equals方法，那么当两个对象的属性值相等时会返回true，但是显然如果没有重写hashcode方法，hashcode值明显不一样，这样就会和规定产生矛盾。
+* 为什么有equals方法还需要hashcode方法
+  * 通常是在集合插入元素时配合使用的，在插入对象的时候，先调用该对象的hashcode方法，得到哈希码值，如果table中不存在该哈希码值，那么直接插入，但是如果table中存在该哈希码值，就会继续调用equals方法，判断两个对象是否真的相同，相同的就不存，不相同就存进去。
+
+## 5. String和StringBuffer、StringBuilder的区别
+
+* String采用**final修饰的字符数组来保存字符串**，属于不可变类，一旦修改了String的值，就会产生新的String对象。
+* StringBuilder类采用**无final修饰的字符数组来保存字符串**，属于可变类，修改值的时候直接在原对象上进行操作。
+* StringBuffer类和StringBuilder类基本一样，唯一的不同就是StringBuffer中的方法都是用synchronized修饰的，因此是线程安全的。
+* **应用场景**：如果需要经常修改字符串，就使用StringBuffer和StringBuilder，优先选择StringBuilder，效率较高，但是多线程使用共享变量的时候，优先选择StringBuffer，保证线程安全。
+* **StringBuffer和StringBuilder的扩容机制**：有参和无参扩容方法都一样的。都是从当前容量开始扩容
+  * **一次追加长度超过当前容量**，则会按照 **当前容量*2+2** 扩容一次；
+  * **一次追加长度不仅超过初始容量，而且按照 当前容量\*2+2 扩容一次也不够**，其容量会**直接扩容到与所添加的字符串长度相等的长度**。之后再追加的话，还会按照 当前容量\*2+2进行扩容。
+
+## 6. ArrayList和LinkedList区别
+
+* **ArrayList是基于动态数组**（动态数组实际上是新建一个新的符合要求大小的数组）的数据结构，而**LinkedList是基于链表**的数据结构。
+* ArrayList存储元素在内存空间是连续的，而LinkedList存储元素在内存空间是不连续的。
+* **ArrayList适合随机访问（下标的方式），不适合插入和删除操作**，因为这样会移动大量元素，而**LinkedList不适合随机访问，适合插入和删除操作**。
+
+## 7. ArrayList扩容过程
+
+* 当创建ArrayList对象时，调用空参构造方法的时候，首先初始化的数组大小为0，第一次添加元素的时候，会将数组的长度扩充为10，当添加的元素超过10个的时候，首先会扩容到15，依次类推，每次扩充为原长度的1.5倍，最大能扩容的长度为： Integer.MAX_VALUE = $2^{31} - 1$ 。
+* 源码：int newCapacity = oldCapacity - (oldCapacity >> 1);
+
+## 8.HashMap底层实现
+
+* 在**jdk1.8之前，hashmap由数组-链表数据结构组成**，在j**dk1.8之后hashmap由数组-链表-红黑树数据结构组成**。
+* 当创建hashmap对象的时候
+  * jdk1.8以前会创建一个长度16的Entry数组；
+  * jdk1.8以后就不是初始化对象时创建数组了，而是在第一次put元素的时候，创建一个长度位16的Node数组；当我们向对象中插入数据的时候，首先调用hashcode方法计算出key的hash值，然后对数组长度取余，计算出向Node数组中存储数据的索引值；
+    * 如果计算出的索引位置出没有数据，则直接将数据存储到数组中，；
+    * 如果计算出的索引位置处已经有数据了，此时会比较两个key的hash值是否相同
+      * 如果不相同，那么在此位置画出一个节点来存储该数据（拉链法）；
+      * 如果相同，此时发生hash碰撞，那么底层就会调用equals方法比较两个key的内容是否相同，如果相同就将后添加的数据的value覆盖之前的value；如果不相同就继续向下和其他数据的key进行比较，如果都不相等，划出一个节点存储数据；
+    * 如果链表长度大于阈值8（链表长度符合泊松分布，而长度为8个命中概率很小），并且数组长度大于64，则将链表转为红黑树，并且当长度小于等于6（不选择7是防止频繁的发生转换）的时候将红黑树退化为链表。
+
